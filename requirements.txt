@@ -1,0 +1,20 @@
+# Core dependencies
+requests>=2.25.0
+cryptography>=3.4.0
+pyyaml>=5.4.0
+python-dotenv>=0.15.0
+
+# Network tools
+scapy>=2.4.4
+paramiko>=2.7.2
+
+# Web tools
+beautifulsoup4>=4.9.3
+selenium>=3.141.0
+
+# Data processing
+pandas>=1.2.0
+numpy>=1.19.5
+
+# Visualization
+matplotlib>=3.3.3
