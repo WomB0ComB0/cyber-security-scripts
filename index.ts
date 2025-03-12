@@ -6,6 +6,11 @@
   const fs = require("node:fs") as typeof import("node:fs");
   const path = require("node:path") as typeof import("node:path");
   
+  // Import Logger class directly at the top level
+  // This is a simple import we can do statically without dynamic imports
+  const { Logger } = require("./logger") as typeof import("./logger");
+  const logger = new Logger("Main");
+  
   // Only import modules when needed using dynamic imports
   // These will be properly type-checked while being lazily loaded
   const importProcess = async (): Promise<typeof import("node:process")> =>
@@ -32,8 +37,9 @@
       try {
         const bun = await import("bun");
         this.execFn = bun.$;
+        logger.info("Bun execution provider initialized");
       } catch (error) {
-        console.error("Failed to initialize Bun execution provider:", error);
+        logger.error("Failed to initialize Bun execution provider:", error);
       }
     }
     
@@ -43,14 +49,16 @@
       }
       
       try {
+        logger.debug(`Executing with Bun: ${command} ${args.join(" ")}`);
         const cmdStr = `${command} ${args.join(" ")}`;
-        const result = await this.execFn([cmdStr as TemplateStringsArray[]], { stdout: "pipe", stderr: "pipe" });
+        const result = await this.execFn`${cmdStr}`;
         return {
           stdout: result.stdout.toString(),
           stderr: result.stderr.toString(),
           exitCode: result.exitCode
         };
       } catch (error: any) {
+        logger.error(`Bun execution error: ${error.message}`, error);
         return {
           stdout: "",
           stderr: error.message || "Unknown error",
@@ -65,6 +73,7 @@
     name = "Node";
     
     async execute(command: string, args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+      logger.debug(`Executing with Node: ${command} ${args.join(" ")}`);
       const childProcess = await import("node:child_process");
       return new Promise((resolve) => {
         const proc = childProcess.spawn(command, args);
@@ -99,6 +108,7 @@
       // Register providers in order of preference
       this.providers.push(new BunExecutionProvider());
       this.providers.push(new NodeExecutionProvider());
+      logger.debug(`Registered ${this.providers.length} execution providers`);
     }
     
     async initialize(): Promise<void> {
@@ -106,12 +116,13 @@
       for (const provider of this.providers) {
         try {
           // Test provider with a simple command
+          logger.debug(`Testing provider: ${provider.name}`);
           await provider.execute("echo", ["test"]);
           this.selectedProvider = provider;
-          console.log(`Using ${provider.name} execution provider`);
+          logger.info(`Using ${provider.name} execution provider`);
           break;
         } catch (error) {
-          console.log(`Provider ${provider.name} not available: ${error}`);
+          logger.warn(`Provider ${provider.name} not available: ${error}`);
           continue;
         }
       }
@@ -130,19 +141,10 @@
     }
   }
   
-  // Define a type for the logger module to improve readability
-  type LoggerModule = typeof import("./logger");
-  
-  // Use a proper function name that indicates its purpose
-  const importLogger = async (): Promise<LoggerModule> => {
-    const loggerModule = await import("./logger");
-    return loggerModule;
-  };
-  
-  // Only access the Logger when needed
-  const getLogger = async (): Promise<LoggerModule["Logger"]> => {
-    const module = await importLogger();
-    return module.Logger;
+  // Import ThreadPool for parallel task execution
+  const importThreadPool = async (): Promise<typeof import("./worker").ThreadPool> => {
+    const { ThreadPool } = await import("./worker");
+    return ThreadPool;
   };
   
   // Configuration manager
@@ -150,7 +152,8 @@
     private config: Record<string, any> = {
       concurrency: 2,
       timeout: 30000,
-      retryAttempts: 3
+      retryAttempts: 3,
+      useThreadPool: false
     };
     
     async loadConfig(configPath?: string): Promise<void> {
@@ -162,12 +165,10 @@
           const configContent = fs.readFileSync(absolutePath, 'utf8');
           const userConfig = JSON.parse(configContent);
           this.config = { ...this.config, ...userConfig };
-          const logger = await getLogger();
-          logger.info(`Loaded configuration from ${absolutePath}`);
+          logger.info(`Loaded configuration from ${absolutePath}`, { config: this.config });
         }
       } catch (error) {
-        const logger = await getLogger();
-        logger.error(`Error loading configuration: ${error}`);
+        logger.error(`Error loading configuration: ${error}`, error);
       }
     }
     
@@ -180,6 +181,7 @@
   class ScriptExecutor {
     private executionService: ExecutionService;
     private configManager: ConfigManager;
+    private threadPool: import("./worker").ThreadPool | null = null;
     
     constructor() {
       this.executionService = new ExecutionService();
@@ -189,97 +191,173 @@
     async initialize(configPath?: string): Promise<void> {
       await this.executionService.initialize();
       await this.configManager.loadConfig(configPath);
+      
+      // Initialize thread pool if enabled in config
+      const useThreadPool = this.configManager.get<boolean>('useThreadPool', false);
+      if (useThreadPool) {
+        logger.info("Thread pool enabled, initializing...");
+        try {
+          const ThreadPoolClass = await importThreadPool();
+          const maxWorkers = this.configManager.get<number>('maxWorkers', 4);
+          const workerScript = this.configManager.get<string>('workerScript', './worker.js');
+          this.threadPool = new ThreadPoolClass(workerScript, maxWorkers);
+          logger.info(`Thread pool initialized with max ${maxWorkers} workers`);
+        } catch (error) {
+          logger.error("Failed to initialize thread pool", error);
+        }
+      }
     }
     
     // Execute a single script
     async executeScript(scriptPath: string): Promise<void> {
-      try {
-        const absolutePath = path.resolve(scriptPath);
-        if (!fs.existsSync(absolutePath)) {
-          const logger = await getLogger();
-          logger.error(`Script not found: ${absolutePath}`);
-          return;
-        }
-        
-        const logger = await getLogger();
-        logger.info(`Executing script: ${absolutePath}`);
-        
-        const timeout = this.configManager.get<number>('timeout', 30000);
-        const result = await Promise.race([
-          this.executionService.execute('node', [absolutePath]),
-          new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error(`Execution timed out after ${timeout}ms`)), timeout);
-          })
-        ]);
-        
-        if (result.exitCode !== 0) {
-          logger.error(`Script execution failed with code ${result.exitCode}: ${result.stderr}`);
-        } else {
-          logger.info(`Finished executing: ${absolutePath}`);
-          if (result.stdout) {
-            logger.debug(`Script output: ${result.stdout}`);
+      return await logger.time(`Execute ${scriptPath}`, async () => {
+        try {
+          const absolutePath = path.resolve(scriptPath);
+          if (!fs.existsSync(absolutePath)) {
+            logger.error(`Script not found: ${absolutePath}`);
+            return;
           }
+          
+          logger.info(`Executing script: ${absolutePath}`);
+          
+          const timeout = this.configManager.get<number>('timeout', 30000);
+          const result = await Promise.race([
+            this.executionService.execute('node', [absolutePath]),
+            new Promise<never>((_, reject) => {
+              setTimeout(() => reject(new Error(`Execution timed out after ${timeout}ms`)), timeout);
+            })
+          ]);
+          
+          if (result.exitCode !== 0) {
+            logger.error(`Script execution failed with code ${result.exitCode}`, { 
+              stderr: result.stderr,
+              script: absolutePath
+            });
+          } else {
+            logger.success(`Finished executing: ${absolutePath}`);
+            if (result.stdout) {
+              logger.debug(`Script output:`, { stdout: result.stdout });
+            }
+          }
+        } catch (error) {
+          logger.error(`Error executing script: ${error}`, { 
+            error,
+            script: scriptPath
+          });
         }
-      } catch (error) {
-        const logger = await getLogger();
-        logger.error(`Error executing script: ${error}`);
+      });
+    }
+    
+    /**
+     * Execute a script using the thread pool if available
+     * This is an optimized execution path for compatible scripts
+     */
+    private async executeWithThreadPool(scriptPath: string): Promise<void> {
+      if (!this.threadPool) {
+        throw new Error("Thread pool not initialized");
       }
+      
+      const scriptContent = fs.readFileSync(scriptPath, 'utf8');
+      
+      return await logger.time(`ThreadPool execution: ${scriptPath}`, async () => {
+        try {
+          logger.info(`Submitting script to thread pool: ${scriptPath}`);
+          
+          // Submit the script as a task to the thread pool
+          // This assumes we have a EXECUTE_SCRIPT task type registered in worker.ts
+          const result = await this.threadPool!.submitTask("EXECUTE_SCRIPT", {
+            scriptPath,
+            scriptContent
+          });
+          
+          logger.success(`Thread pool execution complete: ${scriptPath}`);
+          return result as void;
+        } catch (error) {
+          logger.error(`Thread pool execution failed for ${scriptPath}`, error);
+          // Fall back to regular execution
+          logger.info(`Falling back to standard execution for: ${scriptPath}`);
+          await this.executeScript(scriptPath);
+        }
+      });
     }
     
     // Execute multiple scripts in batch
     async executeBatch(scriptPaths: string[]): Promise<void> {
-      const logger = await getLogger();
-      
-      const concurrency = this.configManager.get<number>('concurrency', 2);
-      const retryAttempts = this.configManager.get<number>('retryAttempts', 3);
-      const timeout = this.configManager.get<number>('timeout', 30000);
-      
-      logger.info(`Starting batch execution of ${scriptPaths.length} scripts with concurrency ${concurrency}`);
-      
-      // Custom implementation to execute scripts in batches with concurrency control
-      const executeWithRetry = async (scriptPath: string, attempt = 1): Promise<void> => {
-        try {
-          await this.executeScript(scriptPath);
-        } catch (error) {
-          if (attempt < retryAttempts) {
-            logger.warn(`Retry attempt ${attempt + 1} for script: ${scriptPath}`);
-            await executeWithRetry(scriptPath, attempt + 1);
-          } else {
-            logger.error(`Failed to execute script after ${retryAttempts} attempts: ${scriptPath}`);
+      return await logger.time("Batch execution", async () => {
+        logger.group(`Starting batch execution of ${scriptPaths.length} scripts`);
+        
+        const concurrency = this.configManager.get<number>('concurrency', 2);
+        const retryAttempts = this.configManager.get<number>('retryAttempts', 3);
+        const useThreadPool = this.configManager.get<boolean>('useThreadPool', false) && this.threadPool !== null;
+        
+        logger.info(`Execution parameters:`, {
+          concurrency, 
+          retryAttempts,
+          useThreadPool
+        });
+        
+        // Custom implementation to execute scripts in batches with concurrency control
+        const executeWithRetry = async (scriptPath: string, attempt = 1): Promise<void> => {
+          try {
+            if (useThreadPool) {
+              await this.executeWithThreadPool(scriptPath);
+            } else {
+              await this.executeScript(scriptPath);
+            }
+          } catch (error) {
+            if (attempt < retryAttempts) {
+              logger.warn(`Retry attempt ${attempt + 1} for script: ${scriptPath}`);
+              await executeWithRetry(scriptPath, attempt + 1);
+            } else {
+              logger.error(`Failed to execute script after ${retryAttempts} attempts: ${scriptPath}`, { error });
+            }
+          }
+        };
+        
+        // Process scripts in batches according to concurrency setting
+        let activePromises: Promise<void>[] = [];
+        let index = 0;
+        
+        while (index < scriptPaths.length) {
+          // If active promises are less than concurrency, add more
+          while (activePromises.length < concurrency && index < scriptPaths.length) {
+            const scriptPath = scriptPaths[index++];
+            activePromises.push(executeWithRetry(scriptPath));
+          }
+          
+          if (activePromises.length > 0) {
+            // Wait for at least one promise to complete
+            await Promise.race(activePromises);
+            // Filter out completed promises
+            activePromises = activePromises.filter(p => p.then(() => false, () => false).catch(() => false));
           }
         }
-      };
-      
-      // Process scripts in batches according to concurrency setting
-      let activePromises: Promise<void>[] = [];
-      let index = 0;
-      
-      while (index < scriptPaths.length) {
-        // If active promises are less than concurrency, add more
-        while (activePromises.length < concurrency && index < scriptPaths.length) {
-          const scriptPath = scriptPaths[index++];
-          activePromises.push(executeWithRetry(scriptPath));
+        
+        // Wait for any remaining promises
+        if (activePromises.length > 0) {
+          await Promise.all(activePromises);
         }
         
-        if (activePromises.length > 0) {
-          // Wait for at least one promise to complete
-          await Promise.race(activePromises);
-          // Filter out completed promises
-          activePromises = activePromises.filter(p => p.then(() => false, () => false).catch(() => false));
-        }
+        logger.groupEnd();
+        logger.success("Batch execution completed");
+      });
+    }
+    
+    /**
+     * Clean up resources before exiting
+     */
+    async cleanup(): Promise<void> {
+      if (this.threadPool) {
+        logger.info("Shutting down thread pool");
+        this.threadPool.shutdown();
       }
-      
-      // Wait for any remaining promises
-      if (activePromises.length > 0) {
-        await Promise.all(activePromises);
-      }
-      
-      logger.info("Batch execution completed");
     }
   }
   
   // Main function to handle script execution
   const main = async (): Promise<void> => {
+    logger.info("Starting cyber-security-scripts execution");
+    
     const executor = new ScriptExecutor();
     
     // Look for a config flag (--config=path/to/config.json)
@@ -289,27 +367,34 @@
     // Filter out config argument from scripts list
     const scripts = argv.slice(2).filter(arg => !arg.startsWith('--config='));
     
-    await executor.initialize(configPath);
-    
-    if (scripts.length === 0) {
-      const logger = await getLogger();
-      logger.error("No scripts specified. Usage: bun run script.ts [--config=config.json] script1.js [script2.js ...]");
-      return;
-    }
-    
-    if (scripts.length === 1) {
-      // Single script execution
-      await executor.executeScript(scripts[0]);
-    } else {
-      // Multiple scripts in batch
-      await executor.executeBatch(scripts);
+    try {
+      await executor.initialize(configPath);
+      
+      if (scripts.length === 0) {
+        logger.error("No scripts specified. Usage: bun run script.ts [--config=config.json] script1.js [script2.js ...]");
+        return;
+      }
+      
+      if (scripts.length === 1) {
+        // Single script execution
+        await executor.executeScript(scripts[0]);
+      } else {
+        // Multiple scripts in batch
+        await executor.executeBatch(scripts);
+      }
+      
+      // Clean up resources
+      await executor.cleanup();
+      logger.success("Execution completed successfully");
+    } catch (error) {
+      logger.error(`Execution failed: ${error}`, error);
+      process.exit(1);
     }
   };
   
   // Start execution
-  main().catch(async (error) => {
-    const logger = await getLogger();
-    logger.error(`Error in main execution: ${error}`);
+  main().catch(error => {
+    logger.error(`Unhandled error in main execution: ${error}`, { error });
     process.exit(1);
   });
 })();
