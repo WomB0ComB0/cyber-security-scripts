@@ -44,7 +44,7 @@
       
       try {
         const cmdStr = `${command} ${args.join(" ")}`;
-        const result = await this.execFn([cmdStr], { stdout: "pipe", stderr: "pipe" });
+        const result = await this.execFn([cmdStr as TemplateStringsArray[]], { stdout: "pipe", stderr: "pipe" });
         return {
           stdout: result.stdout.toString(),
           stderr: result.stderr.toString(),
@@ -131,12 +131,11 @@
   }
   
   // Define a type for the logger module to improve readability
-  type LoggerModule = typeof import("./logger.ts");
-  type WorkerModule = typeof import("./worker.ts");
+  type LoggerModule = typeof import("./logger");
   
   // Use a proper function name that indicates its purpose
   const importLogger = async (): Promise<LoggerModule> => {
-    const loggerModule = await import("./logger.ts");
+    const loggerModule = await import("./logger");
     return loggerModule;
   };
   
@@ -144,12 +143,6 @@
   const getLogger = async (): Promise<LoggerModule["Logger"]> => {
     const module = await importLogger();
     return module.Logger;
-  };
-  
-  // Import worker for batch processing
-  const importWorker = async (): Promise<WorkerModule> => {
-    const workerModule = await import("./worker.ts");
-    return workerModule;
   };
   
   // Configuration manager
@@ -233,22 +226,53 @@
       }
     }
     
-    // Execute multiple scripts in batch using worker
+    // Execute multiple scripts in batch
     async executeBatch(scriptPaths: string[]): Promise<void> {
-      const workerModule = await importWorker();
       const logger = await getLogger();
       
       const concurrency = this.configManager.get<number>('concurrency', 2);
       const retryAttempts = this.configManager.get<number>('retryAttempts', 3);
+      const timeout = this.configManager.get<number>('timeout', 30000);
       
       logger.info(`Starting batch execution of ${scriptPaths.length} scripts with concurrency ${concurrency}`);
       
-      // Pass configuration to worker
-      await workerModule.executeBatch(scriptPaths, {
-        concurrency,
-        retryAttempts,
-        timeout: this.configManager.get<number>('timeout', 30000)
-      });
+      // Custom implementation to execute scripts in batches with concurrency control
+      const executeWithRetry = async (scriptPath: string, attempt = 1): Promise<void> => {
+        try {
+          await this.executeScript(scriptPath);
+        } catch (error) {
+          if (attempt < retryAttempts) {
+            logger.warn(`Retry attempt ${attempt + 1} for script: ${scriptPath}`);
+            await executeWithRetry(scriptPath, attempt + 1);
+          } else {
+            logger.error(`Failed to execute script after ${retryAttempts} attempts: ${scriptPath}`);
+          }
+        }
+      };
+      
+      // Process scripts in batches according to concurrency setting
+      let activePromises: Promise<void>[] = [];
+      let index = 0;
+      
+      while (index < scriptPaths.length) {
+        // If active promises are less than concurrency, add more
+        while (activePromises.length < concurrency && index < scriptPaths.length) {
+          const scriptPath = scriptPaths[index++];
+          activePromises.push(executeWithRetry(scriptPath));
+        }
+        
+        if (activePromises.length > 0) {
+          // Wait for at least one promise to complete
+          await Promise.race(activePromises);
+          // Filter out completed promises
+          activePromises = activePromises.filter(p => p.then(() => false, () => false).catch(() => false));
+        }
+      }
+      
+      // Wait for any remaining promises
+      if (activePromises.length > 0) {
+        await Promise.all(activePromises);
+      }
       
       logger.info("Batch execution completed");
     }
