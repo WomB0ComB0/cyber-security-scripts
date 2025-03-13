@@ -187,7 +187,7 @@
 
   // Configuration manager with validation and caching
   class ConfigManager {
-    private config: Record<string, any> = {
+    private config: Record<string, unknown> = {
       concurrency: 2,
       timeout: 30000,
       retryAttempts: 3,
