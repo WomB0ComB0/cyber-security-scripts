@@ -1,0 +1,1 @@
+(require.main === module) && console.log('Hello from test.ts');
